@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Console Tools
 // @namespace    almas-apps
-// @version      1.4.0
+// @version      1.7.0
 // @description  Floating gear menu of Play Console utilities. Bump @version on every change so Tampermonkey picks it up.
 // @updateURL    http://localhost:8765/console-tools.user.js
 // @downloadURL  http://localhost:8765/console-tools.user.js
 // @match        https://play.google.com/console/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
+// @connect      open.er-api.com
 // @noframes
 // @run-at       document-idle
 // ==/UserScript==
@@ -53,7 +54,7 @@
   // each target in turn, and stop as soon as aria-checked actually flips. Last
   // resort is the keyboard: focus it and press Space.
   function fire(el, type, x, y) {
-    const opts = { bubbles: true, cancelable: true, composed: true, view: window,
+    const opts = { bubbles: true, cancelable: true, composed: true,
                    clientX: x, clientY: y, button: 0, buttons: 1 };
     const E = type.startsWith('pointer') ? PointerEvent : MouseEvent;
     el.dispatchEvent(new E(type, type.startsWith('pointer')
@@ -172,6 +173,205 @@
     say(`Cleared ${on.length} selections.`);
   }
 
+  // --- Order management ---------------------------------------------------
+  //
+  // Read-only: the Console's table is left alone apart from hiding test rows.
+  // License-tester orders show "Test: " in front of the product name.
+  //
+  // Every order that passes through the table (any page, sort or search) is
+  // remembered until reload, so the stats cover everything you've paged through.
+
+  const HOME_CURRENCY = 'CAD';
+  // Free, no key, covers GHS/PHP etc. Fetched through GM_xmlhttpRequest so the
+  // Console's CSP can't block it. Cached for 12 hours.
+  const RATES_URL = `https://open.er-api.com/v6/latest/${HOME_CURRENCY}`;
+  const RATES_KEY = 'almas-fx-' + HOME_CURRENCY;
+  const TEST_KEY = 'almas-hide-test-orders';
+  const OVERLAY_KEY = 'almas-orders-overlay';
+
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+  };
+
+  let hideTests = store.get(TEST_KEY) === '1';
+  let showOverlay = store.get(OVERLAY_KEY) === '1';
+
+  let rates = null, ratesDate = '', ratesTried = false;
+  function loadRates() {
+    if (rates || ratesTried) return;
+    ratesTried = true;
+    try {
+      const c = JSON.parse(store.get(RATES_KEY) || 'null');
+      if (c && Date.now() - c.at < 12 * 3600e3) { rates = c.rates; ratesDate = c.date; return; }
+    } catch (e) {}
+    if (typeof GM_xmlhttpRequest !== 'function') return;
+    GM_xmlhttpRequest({
+      method: 'GET', url: RATES_URL,
+      onload: (r) => {
+        try {
+          const j = JSON.parse(r.responseText);
+          if (j.result !== 'success') return;
+          rates = j.rates;
+          ratesDate = (j.time_last_update_utc || '').slice(5, 16);
+          store.set(RATES_KEY, JSON.stringify({ at: Date.now(), rates, date: ratesDate }));
+          scheduleOrders();
+        } catch (e) {}
+      },
+    });
+  }
+
+  const orderPage = () => document.querySelector('orders-list-page');
+  const orderRows = () =>
+    [...document.querySelectorAll('orders-list-page .particle-table-row')];
+  const cellText = (row, field) =>
+    row.querySelector(`ess-cell[essfield="${field}"] .main-text`)?.textContent.trim() || '';
+  const orderId = (row) =>
+    row.querySelector('ess-cell[essfield="order_id_column"]')?.textContent.trim() || '';
+  const isTestRow = (row) => /^Test:/i.test(cellText(row, 'product_column'));
+
+  // order id -> { test, currency, amount, product }
+  const seen = new Map();
+
+  function collect() {
+    for (const r of orderRows()) {
+      const id = orderId(r);
+      if (!id) continue;
+      const m = cellText(r, 'total_column').match(/^([A-Z]{3})\s*([\d.,]+)/);
+      seen.set(id, {
+        test: isTestRow(r),
+        currency: m ? m[1] : '',
+        amount: m ? parseFloat(m[2].replace(/,/g, '')) : 0,
+        product: cellText(r, 'product_column').replace(/\s*\(.*\)$/, ''),
+      });
+    }
+  }
+
+  function applyOrderFilter() {
+    for (const row of orderRows()) {
+      const hide = hideTests && isTestRow(row);
+      if ((row.style.display === 'none') !== hide) row.style.display = hide ? 'none' : '';
+    }
+  }
+
+  function summarize() {
+    const sums = {}, products = {};
+    let tests = 0, real = 0, paid = 0;
+    for (const o of seen.values()) {
+      if (o.test) { tests++; continue; }
+      real++;
+      // Refunded orders show a 0.00 total, so "paid" is simply total > 0.
+      if (o.amount > 0) {
+        paid++;
+        sums[o.currency] = (sums[o.currency] || 0) + o.amount;
+        products[o.product] = (products[o.product] || 0) + 1;
+      }
+    }
+    let home = 0;
+    const unconverted = [];
+    for (const [c, v] of Object.entries(sums)) {
+      if (c === HOME_CURRENCY) home += v;
+      else if (rates?.[c]) home += v / rates[c];
+      else unconverted.push(c);
+    }
+    return { total: seen.size, tests, real, paid, sums, products, home, unconverted };
+  }
+
+  const el = (tag, style, text) => {
+    const e = document.createElement(tag);
+    if (style) Object.assign(e.style, style);
+    if (text != null) e.textContent = text;
+    return e;
+  };
+
+  // The stats block, shared by the overlay and the gear menu.
+  function statsBlock() {
+    const s = summarize();
+    const muted = { color: '#5f6368', fontSize: '12px' };
+    const box = el('div');
+    const head = el('div', { display: 'flex', alignItems: 'baseline', gap: '8px' });
+    head.append(
+      el('div', { fontSize: '24px', fontWeight: '700', color: '#137333' }, String(s.paid)),
+      el('div', { fontWeight: '600' }, s.paid === 1 ? 'real purchase' : 'real purchases'),
+    );
+    box.append(head, el('div', muted,
+      `${s.total} orders seen · ${s.tests} test · ${s.real - s.paid} refunded`));
+    if (s.paid) {
+      box.append(el('div', { fontSize: '17px', fontWeight: '600', marginTop: '6px' },
+        `≈ ${HOME_CURRENCY} ${s.home.toFixed(2)}`));
+      if (s.unconverted.length) {
+        box.append(el('div', { ...muted, color: '#b3261e' },
+          (rates ? 'No rate for ' : 'Rates unavailable, not in total: ') + s.unconverted.join(', ')));
+      }
+      box.append(el('div', muted,
+        Object.entries(s.sums).map(([c, v]) => `${c} ${v.toFixed(2)}`).join(' · ')));
+      const list = el('div', { marginTop: '4px' });
+      for (const [p, n] of Object.entries(s.products).sort((a, b) => b[1] - a[1])) {
+        list.append(el('div', null, `${n}× ${p}`));
+      }
+      box.append(list);
+    }
+    box.append(el('div', { ...muted, fontSize: '11px', marginTop: '6px' },
+      'Counts every page you\'ve viewed since reload. Gross, before Google\'s fee' +
+      (ratesDate ? ` · rates ${ratesDate}` : '') + '.'));
+    return { box, key: JSON.stringify([s, !!rates]) };
+  }
+
+  let overlayKey = '';
+  function renderOverlay() {
+    let o = document.getElementById('almas-orders-overlay');
+    if (!showOverlay || !orderPage()) { o?.remove(); overlayKey = ''; return; }
+    const { box, key } = statsBlock();
+    if (o && key === overlayKey) return;
+    overlayKey = key;
+    if (!o) {
+      o = el('div', {
+        position: 'fixed', right: '20px', top: '140px', zIndex: 2147483646,
+        width: '260px', padding: '12px 14px', borderRadius: '12px',
+        background: '#fff', color: '#202124', font: '13px/1.45 system-ui, sans-serif',
+        boxShadow: '0 6px 24px rgba(0,0,0,.22)', pointerEvents: 'none',
+      });
+      o.id = 'almas-orders-overlay';
+      document.body.appendChild(o);
+    }
+    o.replaceChildren(box);
+  }
+
+  function setHideTests(on) {
+    hideTests = on;
+    store.set(TEST_KEY, on ? '1' : '0');
+    applyOrderFilter();
+    if (!orderPage()) say(`Test orders will be ${on ? 'hidden' : 'shown'} on Order management.`);
+  }
+
+  function setOverlay(on) {
+    showOverlay = on;
+    store.set(OVERLAY_KEY, on ? '1' : '0');
+    renderOverlay();
+    if (!orderPage()) say(`Purchase overlay ${on ? 'on' : 'off'}. It shows on Order management.`);
+  }
+
+  function ordersTick() {
+    if (orderPage()) {
+      loadRates();
+      collect();
+      applyOrderFilter();
+    }
+    renderOverlay();
+  }
+
+  let ordersPending = 0;
+  function scheduleOrders() {
+    if (ordersPending) return;
+    ordersPending = requestAnimationFrame(() => { ordersPending = 0; ordersTick(); });
+  }
+
+  new MutationObserver((muts) => {
+    // Ignore our own overlay redraws, or every redraw would schedule another.
+    if (muts.every((m) => m.target.closest?.('#almas-orders-overlay'))) return;
+    scheduleOrders();
+  }).observe(document.body, { childList: true, subtree: true, characterData: true });
+
   // --- UI ---------------------------------------------------------------
 
   let toastTimer;
@@ -212,6 +412,18 @@
       hint: 'Untick every row',
       run: clearAll,
     },
+    {
+      label: 'Hide test orders',
+      get active() { return hideTests; },
+      hint: 'Order management: only real purchases',
+      run: () => setHideTests(!hideTests),
+    },
+    {
+      label: 'Purchase overlay',
+      get active() { return showOverlay; },
+      hint: 'Keep the purchase stats on screen',
+      run: () => setOverlay(!showOverlay),
+    },
   ];
 
   function toggleMenu() {
@@ -221,10 +433,17 @@
     m.id = 'almas-tools-menu';
     Object.assign(m.style, {
       position: 'fixed', right: '20px', bottom: '168px', zIndex: 2147483647,
-      minWidth: '260px', padding: '6px 0', borderRadius: '10px',
+      width: '290px', padding: '6px 0', borderRadius: '10px',
+      maxHeight: 'calc(100vh - 200px)', overflowY: 'auto',
       background: '#fff', color: '#202124', font: '13px/1.4 system-ui, sans-serif',
       boxShadow: '0 6px 24px rgba(0,0,0,.25)',
     });
+    // On Order management the menu opens with the purchase stats.
+    if (orderPage()) {
+      const stats = statsBlock().box;
+      Object.assign(stats.style, { padding: '6px 14px 10px', borderBottom: '1px solid #e8eaed', marginBottom: '4px' });
+      m.appendChild(stats);
+    }
     for (const t of TOOLS) {
       const row = document.createElement('button');
       Object.assign(row.style, {
@@ -235,13 +454,17 @@
       // innerHTML assignment throws and kills the whole script silently.
       const title = document.createElement('div');
       title.style.fontWeight = '600';
-      title.textContent = t.label;
+      title.textContent = (t.active ? '✓ ' : '') + t.label;
       const hint = document.createElement('div');
       Object.assign(hint.style, { color: '#5f6368', fontSize: '12px' });
       hint.textContent = t.hint;
       row.append(title, hint);
-      row.onmouseenter = () => (row.style.background = '#f1f3f4');
-      row.onmouseleave = () => (row.style.background = 'none');
+      // Active toggles stay highlighted, like the overlay's pills.
+      const rest = t.active ? '#e8f0fe' : 'none';
+      row.style.background = rest;
+      if (t.active) title.style.color = '#1967d2';
+      row.onmouseenter = () => (row.style.background = t.active ? '#d2e3fc' : '#f1f3f4');
+      row.onmouseleave = () => (row.style.background = rest);
       row.onclick = () => {
         m.remove();
         Promise.resolve(t.run()).catch((e) => say('Error: ' + e.message, true));

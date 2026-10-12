@@ -13,4 +13,4 @@ Tampermonkey → Utilities → Check for updates (or wait for its periodic check
 
 | Script | What it does |
 |---|---|
-| `console-tools.user.js` | Gear menu on play.google.com/console. Price editor: tick Tier 1 (56 countries), Tier 2 (everyone else), or clear. You still press **Set price** and type the price. |
+| `console-tools.user.js` | Gear menu on play.google.com/console. Price editor: tick Tier 1 (56 countries), Tier 2 (everyone else), or clear. You still press **Set price** and type the price. Order management: the menu opens with a count of real purchases (test orders excluded, totals converted to CAD via open.er-api.com) covering every page viewed since reload. Toggles: **Hide test orders**, **Purchase overlay** (keeps the stats on screen). |
