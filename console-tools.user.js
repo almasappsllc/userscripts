@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Console Tools
 // @namespace    almas-apps
-// @version      1.7.0
+// @version      1.8.0
 // @description  Floating gear menu of Play Console utilities. Bump @version on every change so Tampermonkey picks it up.
 // @updateURL    http://localhost:8765/console-tools.user.js
 // @downloadURL  http://localhost:8765/console-tools.user.js
@@ -175,8 +175,9 @@
 
   // --- Order management ---------------------------------------------------
   //
-  // Read-only: the Console's table is left alone apart from hiding test rows.
-  // License-tester orders show "Test: " in front of the product name.
+  // Read-only: the Console's table is left alone apart from hiding test and
+  // refunded rows. License-tester orders show "Test: " in front of the product
+  // name; refunded orders show "Refunded" in the status column.
   //
   // Every order that passes through the table (any page, sort or search) is
   // remembered until reload, so the stats cover everything you've paged through.
@@ -187,6 +188,7 @@
   const RATES_URL = `https://open.er-api.com/v6/latest/${HOME_CURRENCY}`;
   const RATES_KEY = 'almas-fx-' + HOME_CURRENCY;
   const TEST_KEY = 'almas-hide-test-orders';
+  const REFUND_KEY = 'almas-hide-refunded-orders';
   const OVERLAY_KEY = 'almas-orders-overlay';
 
   const store = {
@@ -195,6 +197,7 @@
   };
 
   let hideTests = store.get(TEST_KEY) === '1';
+  let hideRefunds = store.get(REFUND_KEY) === '1';
   let showOverlay = store.get(OVERLAY_KEY) === '1';
 
   let rates = null, ratesDate = '', ratesTried = false;
@@ -229,8 +232,10 @@
   const orderId = (row) =>
     row.querySelector('ess-cell[essfield="order_id_column"]')?.textContent.trim() || '';
   const isTestRow = (row) => /^Test:/i.test(cellText(row, 'product_column'));
+  // Exact match: a partially refunded order still earned something.
+  const isRefundedRow = (row) => /^Refunded$/i.test(cellText(row, 'order_status_column'));
 
-  // order id -> { test, currency, amount, product }
+  // order id -> { test, refunded, currency, amount, product }
   const seen = new Map();
 
   function collect() {
@@ -240,6 +245,7 @@
       const m = cellText(r, 'total_column').match(/^([A-Z]{3})\s*([\d.,]+)/);
       seen.set(id, {
         test: isTestRow(r),
+        refunded: isRefundedRow(r),
         currency: m ? m[1] : '',
         amount: m ? parseFloat(m[2].replace(/,/g, '')) : 0,
         product: cellText(r, 'product_column').replace(/\s*\(.*\)$/, ''),
@@ -249,23 +255,24 @@
 
   function applyOrderFilter() {
     for (const row of orderRows()) {
-      const hide = hideTests && isTestRow(row);
+      const hide = (hideTests && isTestRow(row)) || (hideRefunds && isRefundedRow(row));
       if ((row.style.display === 'none') !== hide) row.style.display = hide ? 'none' : '';
     }
   }
 
   function summarize() {
     const sums = {}, products = {};
-    let tests = 0, real = 0, paid = 0;
+    let total = 0, tests = 0, refunded = 0, paid = 0;
     for (const o of seen.values()) {
+      // Hidden refunds drop out of every count, as if never seen.
+      if (o.refunded && hideRefunds) continue;
+      total++;
       if (o.test) { tests++; continue; }
-      real++;
-      // Refunded orders show a 0.00 total, so "paid" is simply total > 0.
-      if (o.amount > 0) {
-        paid++;
-        sums[o.currency] = (sums[o.currency] || 0) + o.amount;
-        products[o.product] = (products[o.product] || 0) + 1;
-      }
+      // Refunded orders normally show a 0.00 total; the status catches any that don't.
+      if (o.refunded || !(o.amount > 0)) { refunded++; continue; }
+      paid++;
+      sums[o.currency] = (sums[o.currency] || 0) + o.amount;
+      products[o.product] = (products[o.product] || 0) + 1;
     }
     let home = 0;
     const unconverted = [];
@@ -274,7 +281,7 @@
       else if (rates?.[c]) home += v / rates[c];
       else unconverted.push(c);
     }
-    return { total: seen.size, tests, real, paid, sums, products, home, unconverted };
+    return { total, tests, refunded, paid, sums, products, home, unconverted, hideRefunds };
   }
 
   const el = (tag, style, text) => {
@@ -295,7 +302,8 @@
       el('div', { fontWeight: '600' }, s.paid === 1 ? 'real purchase' : 'real purchases'),
     );
     box.append(head, el('div', muted,
-      `${s.total} orders seen · ${s.tests} test · ${s.real - s.paid} refunded`));
+      `${s.total} orders seen · ${s.tests} test` +
+      (s.hideRefunds ? ' · refunds hidden' : ` · ${s.refunded} refunded`)));
     if (s.paid) {
       box.append(el('div', { fontSize: '17px', fontWeight: '600', marginTop: '6px' },
         `≈ ${HOME_CURRENCY} ${s.home.toFixed(2)}`));
@@ -342,6 +350,14 @@
     store.set(TEST_KEY, on ? '1' : '0');
     applyOrderFilter();
     if (!orderPage()) say(`Test orders will be ${on ? 'hidden' : 'shown'} on Order management.`);
+  }
+
+  function setHideRefunds(on) {
+    hideRefunds = on;
+    store.set(REFUND_KEY, on ? '1' : '0');
+    applyOrderFilter();
+    renderOverlay();
+    if (!orderPage()) say(`Refunded orders will be ${on ? 'hidden' : 'shown'} on Order management.`);
   }
 
   function setOverlay(on) {
@@ -417,6 +433,12 @@
       get active() { return hideTests; },
       hint: 'Order management: only real purchases',
       run: () => setHideTests(!hideTests),
+    },
+    {
+      label: 'Hide refunded orders',
+      get active() { return hideRefunds; },
+      hint: 'Order management: drop refunds from the table and stats',
+      run: () => setHideRefunds(!hideRefunds),
     },
     {
       label: 'Purchase overlay',
