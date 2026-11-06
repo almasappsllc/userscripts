@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Console Tools
 // @namespace    almas-apps
-// @version      1.8.0
+// @version      1.9.0
 // @description  Floating gear menu of Play Console utilities. Bump @version on every change so Tampermonkey picks it up.
-// @updateURL    http://localhost:8765/console-tools.user.js
-// @downloadURL  http://localhost:8765/console-tools.user.js
+// @homepageURL  https://github.com/almasappsllc/userscripts
+// @updateURL    https://raw.githubusercontent.com/almasappsllc/userscripts/main/console-tools.user.js
+// @downloadURL  https://raw.githubusercontent.com/almasappsllc/userscripts/main/console-tools.user.js
 // @match        https://play.google.com/console/*
 // @grant        GM_xmlhttpRequest
 // @connect      open.er-api.com
@@ -386,7 +387,169 @@
     // Ignore our own overlay redraws, or every redraw would schedule another.
     if (muts.every((m) => m.target.closest?.('#almas-orders-overlay'))) return;
     scheduleOrders();
+    scheduleMenu();
   }).observe(document.body, { childList: true, subtree: true, characterData: true });
+
+  // --- Keep the left menu open --------------------------------------------
+  //
+  // The Console's left menu shrinks to a strip of icons and only opens while the
+  // mouse is over it. This opens it with a synthetic hover, swallows the "mouse
+  // left the menu" events that would shrink it again, and shifts the page over
+  // so the open menu doesn't cover it. Nothing here relies on the Console's
+  // class names: the menu is whatever tall, narrow element sits at the left edge
+  // of the window, and it counts as open when it reaches past OPEN_X.
+
+  const MENU_KEY = 'almas-keep-menu-open';
+  let keepMenu = store.get(MENU_KEY) !== '0'; // on unless switched off
+
+  const OPEN_X = 140; // wider than the icon strip, narrower than the open menu
+  const vw = () => document.documentElement.clientWidth;
+  // Probe height: below the header, among the menu's rows.
+  const probeY = () => Math.round(Math.min(innerHeight - 20, Math.max(140, innerHeight * 0.35)));
+  const ours = (e) => !!e?.closest?.('[id^="almas-"]');
+
+  // Every element seen as the menu: the icon strip and the open panel may be separate.
+  let menuRoots = [];
+  const inMenu = (e) => !!e && menuRoots.some((m) => m.isConnected && m.contains(e));
+  const menuAt = (x, y) => inMenu(document.elementFromPoint(x, y));
+
+  function findMenu() {
+    const limit = Math.min(480, vw() * 0.4);
+    let menu = null;
+    for (let e = document.elementFromPoint(12, probeY()); e && e !== document.body; e = e.parentElement) {
+      if (ours(e)) return null;
+      const r = e.getBoundingClientRect();
+      if (r.width > limit) break;
+      if (r.width && r.left <= 12 && r.height >= innerHeight * 0.5) menu = e;
+    }
+    if (menu && !inMenu(menu)) {
+      menuRoots = [...menuRoots.filter((m) => m.isConnected && !menu.contains(m)), menu];
+    }
+    return menu;
+  }
+
+  // What a real mouse arriving at (x, y) produces: "over" bubbles up from the
+  // element under it, "enter" goes to each element from the menu down to it.
+  function hoverInto(menu) {
+    const x = 24, y = probeY();
+    const target = document.elementFromPoint(x, y);
+    if (!target || !menu.contains(target)) return;
+    const chain = [];
+    for (let e = target; e; e = e.parentElement) {
+      chain.unshift(e);
+      if (e === menu) break;
+    }
+    const at = { clientX: x, clientY: y, composed: true };
+    const ptr = { ...at, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+    target.dispatchEvent(new PointerEvent('pointerover', { ...ptr, bubbles: true }));
+    for (const e of chain) e.dispatchEvent(new PointerEvent('pointerenter', ptr));
+    target.dispatchEvent(new MouseEvent('mouseover', { ...at, bubbles: true }));
+    for (const e of chain) e.dispatchEvent(new MouseEvent('mouseenter', at));
+    target.dispatchEvent(new PointerEvent('pointermove', { ...ptr, bubbles: true }));
+    target.dispatchEvent(new MouseEvent('mousemove', { ...at, bubbles: true }));
+  }
+
+  // Capturing on window runs before the listeners on the menu itself.
+  for (const type of ['pointerout', 'pointerleave', 'mouseout', 'mouseleave']) {
+    window.addEventListener(type, (e) => {
+      if (keepMenu && inMenu(e.target) && !inMenu(e.relatedTarget)) e.stopImmediatePropagation();
+    }, true);
+  }
+
+  // How far right the open menu reaches, by hit-testing (its children may be
+  // laid out wider than what's visible).
+  function openWidth() {
+    const y = probeY(), max = Math.min(520, vw() * 0.5);
+    let x = OPEN_X;
+    while (x < max && menuAt(x + 4, y)) x += 4;
+    return x + 4;
+  }
+
+  // Inline styles changed to make room, to undo: [element, property, old value].
+  let pushed = [], menuW = 0, roomCol = null;
+  function unpush() {
+    for (const [e, p, v] of pushed.reverse()) e.style[p] = v;
+    pushed = [];
+    menuW = 0;
+    roomCol = null;
+  }
+  function restyle(e, p, v) {
+    pushed.push([e, p, e.style[p]]);
+    e.style[p] = v;
+  }
+
+  // The page column: from a point well inside the page, walk up to the last
+  // element that doesn't also hold the menu.
+  function pageColumn() {
+    let e = document.elementFromPoint(vw() * 0.65, probeY());
+    if (!e || ours(e) || inMenu(e)) return null;
+    while (e.parentElement && !menuRoots.some((m) => e.parentElement.contains(m))) e = e.parentElement;
+    return e.parentElement ? e : null;
+  }
+
+  // Shift every wide block beside the menu (the page, maybe a header) so it
+  // starts where the open menu ends.
+  function makeRoom(w) {
+    const col = pageColumn();
+    if (!col) return;
+    for (const s of col.parentElement.children) {
+      if (ours(s) || inMenu(s) || menuRoots.some((m) => s.contains(m))) continue;
+      const r = s.getBoundingClientRect();
+      if (r.width < vw() * 0.3 || r.height < 40 || r.left >= w - 2) continue;
+      restyle(s, 'marginLeft', `${(parseFloat(getComputedStyle(s).marginLeft) || 0) + w - r.left}px`);
+      const over = s.getBoundingClientRect().right - vw();
+      if (over > 1) restyle(s, 'width', `${parseFloat(getComputedStyle(s).width) - over}px`);
+    }
+    menuW = w;
+    roomCol = col;
+  }
+
+  let menuMiss = 0, menuWarned = false, menuHref = '';
+  function menuTick() {
+    if (!keepMenu) return;
+    if (location.href !== menuHref) { menuHref = location.href; menuMiss = 0; }
+    const menu = findMenu();
+    if (!menu) return;
+    const y = probeY();
+    if (!menuAt(OPEN_X, y)) {
+      if (menuMiss < 3) { menuMiss++; hoverInto(menu); return; }
+      unpush();
+      if (!menuWarned) {
+        menuWarned = true;
+        say('Keep menu open: the left menu wouldn\'t stay open on this page.', true);
+      }
+      return;
+    }
+    menuMiss = 0;
+    // Re-measure only when the edge has moved.
+    const w = menuW && menuAt(menuW - 6, y) && !menuAt(menuW + 2, y) ? menuW : openWidth();
+    const col = pageColumn();
+    if (w !== menuW || (col && col !== roomCol && col.getBoundingClientRect().left < w - 2)) {
+      unpush();
+      makeRoom(w);
+    }
+  }
+
+  let menuTimer = 0;
+  function scheduleMenu() {
+    if (menuTimer || !keepMenu) return;
+    menuTimer = setTimeout(() => {
+      menuTimer = 0;
+      try { menuTick(); } catch (e) { console.error('[Console Tools]', e); }
+    }, 300);
+  }
+  // The menu can shrink without the page adding or removing anything.
+  setInterval(scheduleMenu, 1000);
+  addEventListener('resize', () => { unpush(); scheduleMenu(); });
+
+  function setKeepMenu(on) {
+    keepMenu = on;
+    store.set(MENU_KEY, on ? '1' : '0');
+    menuMiss = 0;
+    if (on) return scheduleMenu();
+    unpush();
+    say('Left menu is back to normal: it closes when the mouse leaves it.');
+  }
 
   // --- UI ---------------------------------------------------------------
 
@@ -445,6 +608,12 @@
       get active() { return showOverlay; },
       hint: 'Keep the purchase stats on screen',
       run: () => setOverlay(!showOverlay),
+    },
+    {
+      label: 'Keep menu open',
+      get active() { return keepMenu; },
+      hint: 'Stop the left menu shrinking to icons',
+      run: () => setKeepMenu(!keepMenu),
     },
   ];
 
