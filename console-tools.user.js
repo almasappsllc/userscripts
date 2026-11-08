@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Console Tools
 // @namespace    almas-apps
-// @version      1.9.1
+// @version      1.11.0
 // @description  Floating gear menu of Play Console utilities. Bump @version on every change so Tampermonkey picks it up.
 // @homepageURL  https://github.com/almasappsllc/userscripts
 // @updateURL    https://raw.githubusercontent.com/almasappsllc/userscripts/main/console-tools.user.js
@@ -181,7 +181,8 @@
   // name; refunded orders show "Refunded" in the status column.
   //
   // Every order that passes through the table (any page, sort or search) is
-  // remembered until reload, so the stats cover everything you've paged through.
+  // remembered until reload, so the stats cover everything you've paged through,
+  // unless "Only count what's on screen" narrows them to the rows in the table now.
 
   const HOME_CURRENCY = 'CAD';
   // Free, no key, covers GHS/PHP etc. Fetched through GM_xmlhttpRequest so the
@@ -190,7 +191,8 @@
   const RATES_KEY = 'almas-fx-' + HOME_CURRENCY;
   const TEST_KEY = 'almas-hide-test-orders';
   const REFUND_KEY = 'almas-hide-refunded-orders';
-  const OVERLAY_KEY = 'almas-orders-overlay';
+  const BAR_KEY = 'almas-orders-overlay';
+  const PAGE_ONLY_KEY = 'almas-orders-page-only';
 
   const store = {
     get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
@@ -199,7 +201,8 @@
 
   let hideTests = store.get(TEST_KEY) === '1';
   let hideRefunds = store.get(REFUND_KEY) === '1';
-  let showOverlay = store.get(OVERLAY_KEY) === '1';
+  let showBar = store.get(BAR_KEY) === '1';
+  let pageOnly = store.get(PAGE_ONLY_KEY) === '1';
 
   let rates = null, ratesDate = '', ratesTried = false;
   function loadRates() {
@@ -261,10 +264,15 @@
     }
   }
 
+  // Either everything seen since reload, or just the orders in the table now.
+  const countedOrders = () => pageOnly
+    ? [...new Set(orderRows().map(orderId))].map((id) => seen.get(id)).filter(Boolean)
+    : [...seen.values()];
+
   function summarize() {
     const sums = {}, products = {};
     let total = 0, tests = 0, refunded = 0, paid = 0;
-    for (const o of seen.values()) {
+    for (const o of countedOrders()) {
       // Hidden refunds drop out of every count, as if never seen.
       if (o.refunded && hideRefunds) continue;
       total++;
@@ -282,7 +290,7 @@
       else if (rates?.[c]) home += v / rates[c];
       else unconverted.push(c);
     }
-    return { total, tests, refunded, paid, sums, products, home, unconverted, hideRefunds };
+    return { total, tests, refunded, paid, sums, products, home, unconverted, hideRefunds, pageOnly };
   }
 
   const el = (tag, style, text) => {
@@ -292,7 +300,7 @@
     return e;
   };
 
-  // The stats block, shared by the overlay and the gear menu.
+  // The full stats block for the gear menu.
   function statsBlock() {
     const s = summarize();
     const muted = { color: '#5f6368', fontSize: '12px' };
@@ -303,7 +311,7 @@
       el('div', { fontWeight: '600' }, s.paid === 1 ? 'real purchase' : 'real purchases'),
     );
     box.append(head, el('div', muted,
-      `${s.total} orders seen · ${s.tests} test` +
+      `${s.total} orders ${s.pageOnly ? 'on screen' : 'seen'} · ${s.tests} test` +
       (s.hideRefunds ? ' · refunds hidden' : ` · ${s.refunded} refunded`)));
     if (s.paid) {
       box.append(el('div', { fontSize: '17px', fontWeight: '600', marginTop: '6px' },
@@ -321,29 +329,66 @@
       box.append(list);
     }
     box.append(el('div', { ...muted, fontSize: '11px', marginTop: '6px' },
-      'Counts every page you\'ve viewed since reload. Gross, before Google\'s fee' +
+      (s.pageOnly ? 'Counts only the orders on screen.' : 'Counts every page you\'ve viewed since reload.') +
+      ' Gross, before Google\'s fee' +
       (ratesDate ? ` · rates ${ratesDate}` : '') + '.'));
     return { box, key: JSON.stringify([s, !!rates]) };
   }
 
-  let overlayKey = '';
-  function renderOverlay() {
-    let o = document.getElementById('almas-orders-overlay');
-    if (!showOverlay || !orderPage()) { o?.remove(); overlayKey = ''; return; }
-    const { box, key } = statsBlock();
-    if (o && key === overlayKey) return;
-    overlayKey = key;
-    if (!o) {
-      o = el('div', {
-        position: 'fixed', right: '20px', top: '140px', zIndex: 2147483646,
-        width: '260px', padding: '12px 14px', borderRadius: '12px',
-        background: '#fff', color: '#202124', font: '13px/1.45 system-ui, sans-serif',
-        boxShadow: '0 6px 24px rgba(0,0,0,.22)', pointerEvents: 'none',
+  // --- Purchase count bar -------------------------------------------------
+  //
+  // One line between the filter row and the order table, so it sits right
+  // above the rows it counts and next to the filters that change them. Hover it
+  // for the per-currency and per-product split; the gear menu has it in full.
+  // (Same storage key as the old floating overlay, so its on/off carries over.)
+
+  const BAR_ID = 'almas-orders-bar';
+  let barKey = '';
+
+  const barAnchor = () =>
+    document.querySelector('orders-list-page orders-filter') ||
+    document.querySelector('orders-list-page console-page-header');
+
+  function renderBar() {
+    let bar = document.getElementById(BAR_ID);
+    const anchor = showBar && orderPage() && barAnchor();
+    if (!anchor) { bar?.remove(); barKey = ''; return; }
+    if (!bar) {
+      // Line up with the filter row's own side padding.
+      const pad = getComputedStyle(anchor.querySelector('.wrapper') || anchor).paddingLeft;
+      bar = el('div', {
+        display: 'flex', flexWrap: 'wrap', alignItems: 'baseline', gap: '2px 14px',
+        padding: `8px ${parseFloat(pad) > 0 ? pad : '24px'}`,
+        fontSize: '13px', lineHeight: '20px',
+        borderBottom: '1px solid rgba(128,128,128,.25)',
       });
-      o.id = 'almas-orders-overlay';
-      document.body.appendChild(o);
+      bar.id = BAR_ID;
+      barKey = '';
     }
-    o.replaceChildren(box);
+    // The Console re-renders around us; put it back after the filters if moved.
+    if (bar.previousElementSibling !== anchor) anchor.after(bar);
+
+    const s = summarize();
+    const key = JSON.stringify([s, !!rates]);
+    if (key === barKey) return;
+    barKey = key;
+
+    const parts = [el('span', { fontSize: '15px', fontWeight: '700' },
+      `${s.paid} real purchase${s.paid === 1 ? '' : 's'}`)];
+    if (s.paid) parts.push(el('span', { fontWeight: '600' }, `≈ ${HOME_CURRENCY} ${s.home.toFixed(2)}`));
+    parts.push(el('span', { opacity: '.7' },
+      `${s.total} ${s.pageOnly ? 'on screen' : 'seen since reload'} · ${s.tests} test` +
+      (s.hideRefunds ? ' · refunds hidden' : ` · ${s.refunded} refunded`)));
+    if (s.paid && s.unconverted.length) {
+      parts.push(el('span', { color: '#b3261e' },
+        (rates ? 'No rate for ' : 'Rates unavailable, not in total: ') + s.unconverted.join(', ')));
+    }
+    bar.replaceChildren(...parts);
+    bar.title = s.paid
+      ? [Object.entries(s.sums).map(([c, v]) => `${c} ${v.toFixed(2)}`).join(' · '),
+         ...Object.entries(s.products).sort((a, b) => b[1] - a[1]).map(([p, n]) => `${n}× ${p}`),
+         'Gross, before Google\'s fee' + (ratesDate ? ` · rates ${ratesDate}` : '')].join('\n')
+      : '';
   }
 
   function setHideTests(on) {
@@ -357,15 +402,22 @@
     hideRefunds = on;
     store.set(REFUND_KEY, on ? '1' : '0');
     applyOrderFilter();
-    renderOverlay();
+    renderBar();
     if (!orderPage()) say(`Refunded orders will be ${on ? 'hidden' : 'shown'} on Order management.`);
   }
 
-  function setOverlay(on) {
-    showOverlay = on;
-    store.set(OVERLAY_KEY, on ? '1' : '0');
-    renderOverlay();
-    if (!orderPage()) say(`Purchase overlay ${on ? 'on' : 'off'}. It shows on Order management.`);
+  function setBar(on) {
+    showBar = on;
+    store.set(BAR_KEY, on ? '1' : '0');
+    renderBar();
+    if (!orderPage()) say(`Purchase count bar ${on ? 'on' : 'off'}. It shows on Order management.`);
+  }
+
+  function setPageOnly(on) {
+    pageOnly = on;
+    store.set(PAGE_ONLY_KEY, on ? '1' : '0');
+    renderBar();
+    if (!orderPage()) say(`Purchase stats will count ${on ? 'only the orders on screen' : 'every page viewed since reload'}.`);
   }
 
   function ordersTick() {
@@ -374,7 +426,9 @@
       collect();
       applyOrderFilter();
     }
-    renderOverlay();
+    renderBar();
+    const m = document.getElementById('almas-tools-menu');
+    if (m) renderMenuStats(m);
   }
 
   let ordersPending = 0;
@@ -384,71 +438,10 @@
   }
 
   new MutationObserver((muts) => {
-    // Ignore our own overlay redraws, or every redraw would schedule another.
-    if (muts.every((m) => m.target.closest?.('#almas-orders-overlay'))) return;
+    // Ignore our own bar and menu redraws, or every redraw would schedule another.
+    if (muts.every((m) => m.target.closest?.('#almas-orders-bar, #almas-tools-menu'))) return;
     scheduleOrders();
-    pinMenu();
   }).observe(document.body, { childList: true, subtree: true, characterData: true });
-
-  // --- Keep the left menu open --------------------------------------------
-  //
-  // The left menu is <material-drawer debug-id="desktop-navigation-drawer">, an
-  // Angular Components persistent drawer. The Console now gives it the class
-  // "hover-expandable", which shrinks it to an icon strip that only opens while
-  // hovered. Taking that class off (and undoing "mat-drawer-collapsed", in case
-  // that's how the strip is drawn) brings back the docked menu, and the page
-  // makes room for it by itself. Angular only rewrites a class when its own
-  // value changes, so a class observer putting ours back is enough.
-
-  const MENU_KEY = 'almas-keep-menu-open';
-  let keepMenu = store.get(MENU_KEY) !== '0'; // on unless switched off
-
-  const DRAWER = 'material-drawer[debug-id="desktop-navigation-drawer"], material-drawer.desktop-navigation-drawer';
-  const DROP = ['hover-expandable', 'mat-drawer-collapsed'];
-  const KEEP = 'mat-drawer-expanded';
-
-  // Drawer -> what we changed on it, so switching the toggle off can undo it.
-  const changed = new Map();
-  const watched = new WeakSet();
-
-  function pinDrawer(d) {
-    const c = d.classList;
-    const log = changed.get(d) || { dropped: new Set(), kept: false };
-    for (const k of DROP) if (c.contains(k)) { c.remove(k); log.dropped.add(k); }
-    if (!c.contains(KEEP)) { c.add(KEEP); log.kept = true; }
-    if (log.dropped.size || log.kept) changed.set(d, log);
-  }
-
-  function pinMenu() {
-    if (!keepMenu) return;
-    for (const d of document.querySelectorAll(DRAWER)) {
-      if (!watched.has(d)) {
-        watched.add(d);
-        new MutationObserver(() => keepMenu && pinDrawer(d))
-          .observe(d, { attributes: true, attributeFilter: ['class'] });
-      }
-      pinDrawer(d);
-    }
-  }
-
-  function unpinMenu() {
-    for (const [d, log] of changed) {
-      if (!d.isConnected) continue;
-      for (const k of log.dropped) d.classList.add(k);
-      if (log.kept) d.classList.remove(KEEP);
-    }
-    changed.clear();
-  }
-
-  function setKeepMenu(on) {
-    keepMenu = on;
-    store.set(MENU_KEY, on ? '1' : '0');
-    if (on) return pinMenu();
-    unpinMenu();
-    say('Left menu is back to the Console\'s default: icons until you hover.');
-  }
-
-  pinMenu();
 
   // --- UI ---------------------------------------------------------------
 
@@ -503,38 +496,41 @@
       run: () => setHideRefunds(!hideRefunds),
     },
     {
-      label: 'Purchase overlay',
-      get active() { return showOverlay; },
-      hint: 'Keep the purchase stats on screen',
-      run: () => setOverlay(!showOverlay),
+      label: 'Purchase count bar',
+      get active() { return showBar; },
+      hint: 'One line above the order table: purchases and CAD total',
+      run: () => setBar(!showBar),
     },
     {
-      label: 'Keep menu open',
-      get active() { return keepMenu; },
-      hint: 'Stop the left menu shrinking to icons',
-      run: () => setKeepMenu(!keepMenu),
+      label: 'Only count what\'s on screen',
+      get active() { return pageOnly; },
+      hint: 'Purchase stats cover just this page, not every page since reload',
+      run: () => setPageOnly(!pageOnly),
     },
   ];
 
-  function toggleMenu() {
-    let m = document.getElementById('almas-tools-menu');
-    if (m) return m.remove();
-    m = document.createElement('div');
-    m.id = 'almas-tools-menu';
-    Object.assign(m.style, {
-      position: 'fixed', right: '20px', bottom: '168px', zIndex: 2147483647,
-      width: '290px', padding: '6px 0', borderRadius: '10px',
-      maxHeight: 'calc(100vh - 200px)', overflowY: 'auto',
-      background: '#fff', color: '#202124', font: '13px/1.4 system-ui, sans-serif',
-      boxShadow: '0 6px 24px rgba(0,0,0,.25)',
-    });
-    // On Order management the menu opens with the purchase stats.
-    if (orderPage()) {
-      const stats = statsBlock().box;
-      Object.assign(stats.style, { padding: '6px 14px 10px', borderBottom: '1px solid #e8eaed', marginBottom: '4px' });
-      m.appendChild(stats);
-    }
+  // The menu's stats follow the table while it's open, like the count bar: the
+  // Console's own filters, paging and our toggles all redraw them. Toggles keep
+  // the menu open and redraw it; the price tools close it, since they work the page.
+
+  let menuStatsKey = '';
+  function renderMenuStats(m) {
+    const slot = m.querySelector('[data-almas-stats]');
+    if (!orderPage()) { slot?.remove(); menuStatsKey = ''; return; }
+    const { box, key } = statsBlock();
+    if (slot && key === menuStatsKey) return;
+    menuStatsKey = key;
+    box.dataset.almasStats = '1';
+    Object.assign(box.style, { padding: '6px 14px 10px', borderBottom: '1px solid #e8eaed', marginBottom: '4px' });
+    if (slot) slot.replaceWith(box); else m.prepend(box);
+  }
+
+  function renderMenu(m) {
+    m.replaceChildren();
+    menuStatsKey = '';
+    renderMenuStats(m);
     for (const t of TOOLS) {
+      const isToggle = 'active' in t;
       const row = document.createElement('button');
       Object.assign(row.style, {
         display: 'block', width: '100%', textAlign: 'left', padding: '8px 14px',
@@ -549,18 +545,35 @@
       Object.assign(hint.style, { color: '#5f6368', fontSize: '12px' });
       hint.textContent = t.hint;
       row.append(title, hint);
-      // Active toggles stay highlighted, like the overlay's pills.
+      // Active toggles stay highlighted.
       const rest = t.active ? '#e8f0fe' : 'none';
       row.style.background = rest;
       if (t.active) title.style.color = '#1967d2';
       row.onmouseenter = () => (row.style.background = t.active ? '#d2e3fc' : '#f1f3f4');
       row.onmouseleave = () => (row.style.background = rest);
       row.onclick = () => {
-        m.remove();
-        Promise.resolve(t.run()).catch((e) => say('Error: ' + e.message, true));
+        if (!isToggle) m.remove();
+        Promise.resolve(t.run())
+          .catch((e) => say('Error: ' + e.message, true))
+          .finally(() => { if (isToggle && m.isConnected) renderMenu(m); });
       };
       m.appendChild(row);
     }
+  }
+
+  function toggleMenu() {
+    let m = document.getElementById('almas-tools-menu');
+    if (m) return m.remove();
+    m = document.createElement('div');
+    m.id = 'almas-tools-menu';
+    Object.assign(m.style, {
+      position: 'fixed', right: '20px', bottom: '168px', zIndex: 2147483647,
+      width: '290px', padding: '6px 0', borderRadius: '10px',
+      maxHeight: 'calc(100vh - 200px)', overflowY: 'auto',
+      background: '#fff', color: '#202124', font: '13px/1.4 system-ui, sans-serif',
+      boxShadow: '0 6px 24px rgba(0,0,0,.25)',
+    });
+    renderMenu(m);
     document.body.appendChild(m);
   }
 
